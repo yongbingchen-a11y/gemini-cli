@@ -56,6 +56,7 @@ import { WorkspaceContext } from '../utils/workspaceContext.js';
 import { Storage } from './storage.js';
 import { FileExclusions } from '../utils/ignorePatterns.js';
 import type { EventEmitter } from 'node:events';
+import { PatchTool } from '../tools/patch.js';
 
 export enum ApprovalMode {
   DEFAULT = 'default',
@@ -508,6 +509,10 @@ export class Config {
     return this.workspaceContext;
   }
 
+  isPathWithinWorkspace(pathToCheck: string): boolean {
+    return this.workspaceContext.isPathWithinWorkspace(pathToCheck);
+  }
+
   getToolRegistry(): ToolRegistry {
     return this.toolRegistry;
   }
@@ -884,6 +889,7 @@ export class Config {
     registerCoreTool(ShellTool, this);
     registerCoreTool(MemoryTool);
     registerCoreTool(WebSearchTool, this);
+    registerCoreTool(PatchTool, this);
 
     await registry.discoverAllTools();
     return registry;
