@@ -28,6 +28,7 @@ import { DEFAULT_DIFF_OPTIONS } from './diffOptions.js';
 import type { Hunk, PatchError } from '../utils/patcher.js';
 import { IdeClient, IDEConnectionStatus } from '../ide/ide-client.js';
 import { fixFailedHunk } from '../utils/patch-fixer.js';
+import { logLocalMetric } from '../utils/local-metrics.js';
 
 /**
  * Parameters for the Patch tool
@@ -61,6 +62,8 @@ interface CalculatedPatch {
   error?: { display: string; raw: string; type: ToolErrorType };
   // The total number of files identified in the original patch.
   totalFiles: number;
+  // Map from filepath to its original content.
+  originalContentByFile: Map<string, string>;
 }
 
 /**
@@ -114,6 +117,7 @@ class PatchToolInvocation
           failedHunks: new Map(),
           noOpHunks: new Map(),
           totalFiles: 0,
+          originalContentByFile: new Map(),
           error: {
             display: 'The provided diff was empty or invalid.',
             raw: 'Patch failed: The unified_diff parameter did not contain any valid hunks.',
@@ -128,6 +132,7 @@ class PatchToolInvocation
         failedHunks: new Map(),
         noOpHunks: new Map(),
         totalFiles: 0,
+        originalContentByFile: new Map(),
         error: {
           display: `Failed to parse the diff: ${(e as Error).message}`,
           raw: `Patch failed during parsing: ${(e as Error).message}`,
@@ -147,6 +152,7 @@ class PatchToolInvocation
       Array<{ hunk: Hunk; error: PatchError }>
     >();
     const noOpHunks = new Map<string, Hunk[]>();
+    const originalContentByFile = new Map<string, string>();
 
     for (const [filepath, hunks] of parsedHunks.entries()) {
       // Handle file deletion as a special case first.
@@ -189,6 +195,7 @@ class PatchToolInvocation
       } catch (err: unknown) {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       }
+      originalContentByFile.set(filepath, originalContent);
 
       const {
         newContent,
@@ -214,7 +221,7 @@ class PatchToolInvocation
               this.config.getGeminiClient(),
               signal,
             );
-
+            console.log(`LLM returned corrected patch:`, correctedPatchString);
             const newlyHealedHunks = parse(correctedPatchString).get(filepath);
 
             if (!newlyHealedHunks || newlyHealedHunks.length === 0) {
@@ -233,6 +240,7 @@ class PatchToolInvocation
             contentAfterHealing = healedContent;
             healedAndAppliedHunks.push(...newlyHealedHunks);
           } catch (_e) {
+            console.log(`Failed to heal hunk:`, _e);
             finalFailedHunks.push(failure);
           }
         }
@@ -282,6 +290,7 @@ class PatchToolInvocation
       failedHunks,
       noOpHunks,
       totalFiles,
+      originalContentByFile,
     };
   }
 
@@ -327,6 +336,8 @@ class PatchToolInvocation
       );
       combinedDiff += fileDiff + '\n';
     }
+
+    console.log('[DEBUG] patch.ts: combinedDiff', combinedDiff.trim());
 
     const firstFilePath = Array.from(patchData.fileDiffInfo.keys())[0];
     const isPartial = patchData.failedHunks.size > 0;
@@ -387,10 +398,11 @@ class PatchToolInvocation
   }
 
   async execute(signal: AbortSignal): Promise<ToolResult> {
+    let result: ToolResult;
     const patchData = await this.calculatePatch(signal);
 
     if (patchData.error) {
-      return {
+      result = {
         llmContent: patchData.error.raw,
         returnDisplay: `Error: ${patchData.error.display}`,
         error: {
@@ -398,13 +410,11 @@ class PatchToolInvocation
           type: patchData.error.type,
         },
       };
-    }
-
-    if (patchData.successfulHunks.size === 0) {
+    } else if (patchData.successfulHunks.size === 0) {
       if (patchData.failedHunks.size > 0) {
         const failedHunksDiff = formatFailedHunksToDiff(patchData.failedHunks);
         const rawError = `Patch failed. No hunks could be applied. Please correct the following hunks:\n${failedHunksDiff}`;
-        return {
+        result = {
           llmContent: rawError,
           returnDisplay: `Error: No changes could be applied from the patch.`,
           error: {
@@ -413,58 +423,85 @@ class PatchToolInvocation
           },
         };
       } else {
-        return {
+        result = {
           llmContent:
             'The patch was applied successfully. No changes were needed as the code already matched the patch.',
           returnDisplay: '✅ All changes from the patch are already present.',
         };
       }
-    }
+    } else {
+      try {
+        const report = await applyPatchesToFS(
+          patchData.successfulHunks,
+          this.config,
+          patchData.totalFiles,
+          this.config.getFileSystemService(),
+        );
 
-    try {
-      const report = await applyPatchesToFS(
-        patchData.successfulHunks,
-        this.config,
-        patchData.totalFiles,
-        this.config.getFileSystemService(),
-      );
+        let llmContent = `Successfully applied some changes.\n${report}`;
+        let finalReport = report;
+        if (patchData.failedHunks.size > 0) {
+          const failedHunksDiff = formatFailedHunksToDiff(
+            patchData.failedHunks,
+          );
+          llmContent += `\n\nThe following hunks failed to apply and need to be corrected:\n${failedHunksDiff}`;
 
-      let llmContent = `Successfully applied some changes.\n${report}`;
-      let finalReport = report;
-      if (patchData.failedHunks.size > 0) {
-        const failedHunksDiff = formatFailedHunksToDiff(patchData.failedHunks);
-        llmContent += `\n\nThe following hunks failed to apply and need to be corrected:\n${failedHunksDiff}`;
-
-        for (const [filepath] of patchData.failedHunks.entries()) {
-          if (!patchData.successfulHunks.has(filepath)) {
-            finalReport += `\n\n❌ ALL HUNKS FAILED for ${filepath}`;
+          for (const [filepath] of patchData.failedHunks.entries()) {
+            if (!patchData.successfulHunks.has(filepath)) {
+              finalReport += `\n\n❌ ALL HUNKS FAILED for ${filepath}`;
+            }
           }
         }
-      }
 
-      if (patchData.noOpHunks.size > 0) {
-        let noOpMessage =
-          '\n\nThe following hunks were skipped as no-ops (the changes were already present):';
-        for (const [filepath, hunks] of patchData.noOpHunks.entries()) {
-          noOpMessage += `\n- ${hunks.length} hunk(s) for ${filepath}`;
+        if (patchData.noOpHunks.size > 0) {
+          let noOpMessage =
+            '\n\nThe following hunks were skipped as no-ops (the changes were already present):';
+          for (const [filepath, hunks] of patchData.noOpHunks.entries()) {
+            noOpMessage += `\n- ${hunks.length} hunk(s) for ${filepath}`;
+          }
+          llmContent += noOpMessage;
         }
-        llmContent += noOpMessage;
-      }
 
-      return {
-        llmContent,
-        returnDisplay: finalReport.trim(),
-      };
-    } catch (e: unknown) {
-      return {
-        llmContent: `Error executing patch: ${(e as Error).message}`,
-        returnDisplay: `Error applying patch: ${(e as Error).message}`,
-        error: {
-          message: (e as Error).message,
-          type: ToolErrorType.EXECUTION_FAILED,
-        },
-      };
+        result = {
+          llmContent,
+          returnDisplay: finalReport.trim(),
+        };
+      } catch (e: unknown) {
+        result = {
+          llmContent: `Error executing patch: ${(e as Error).message}`,
+          returnDisplay: `Error applying patch: ${(e as Error).message}`,
+          error: {
+            message: (e as Error).message,
+            type: ToolErrorType.EXECUTION_FAILED,
+          },
+        };
+      }
     }
+
+    const status = result.error ? 'Failed' : 'Success';
+    const metric: Record<string, unknown> = {
+      tool: 'patch',
+      status,
+      arguments: this.params,
+    };
+    if (result.error) {
+      metric['error'] = result.error.message;
+      if (patchData.failedHunks.size > 0) {
+        const failedFilesContent: Record<string, string> = {};
+        for (const [filepath] of patchData.failedHunks.entries()) {
+          const content = patchData.originalContentByFile.get(filepath);
+          if (content !== undefined) {
+            failedFilesContent[filepath] = content;
+          }
+        }
+        if (Object.keys(failedFilesContent).length > 0) {
+          metric['failed_files_original_content'] = failedFilesContent;
+        }
+      }
+    }
+    await logLocalMetric(this.config, metric);
+
+    return result;
   }
 }
 
